@@ -20,12 +20,49 @@ import hashlib
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 import markdown
 from xhtml2pdf import pisa
 
+
+def _patch_xhtml2pdf_fonts():
+    """Work around an xhtml2pdf bug on Windows: @font-face copies the font
+    into a NamedTemporaryFile that stays locked while open, so reportlab
+    cannot reopen it. Hand reportlab the original local path instead."""
+    from xhtml2pdf.files import pisaFileObject
+
+    orig = pisaFileObject.getNamedFile
+
+    def getNamedFile(self):
+        uri = self.instance.get_uri()
+        if uri and Path(str(uri)).is_file():
+            return str(uri)
+        return orig(self)
+
+    pisaFileObject.getNamedFile = getNamedFile
+
+
+_patch_xhtml2pdf_fonts()
+
 MERMAID_JS = Path(__file__).resolve().parent / "vendor" / "mermaid-10.9.6.min.js"
 MERMAID_BLOCK = re.compile(r"```mermaid[ \t]*\n(.*?)\n[ \t]*```", re.DOTALL)
+
+# xhtml2pdf's built-in Type1 fonts have no emoji glyphs, so emoji come out
+# as black boxes. Wrap emoji runs in a span using a registered emoji font.
+EMOJI_FONT_CANDIDATES = [
+    Path("C:/Windows/Fonts/seguiemj.ttf"),          # Windows: Segoe UI Emoji
+    Path("/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf"),  # Linux
+]
+EMOJI_RUN = re.compile(
+    "["
+    "\\U0001F000-\\U0001FAFF"  # emoji, pictographs, transport, supplemental
+    "\\u2300-\\u23FF"          # misc technical (watch, hourglass, ...)
+    "\\u2600-\\u27BF"          # misc symbols & dingbats
+    "\\u2B00-\\u2BFF"          # misc symbols & arrows (stars, ...)
+    "\\uFE0F"                  # variation selector riding on the emoji
+    "]+"
+)
 
 # A4 minus margins is ~493pt; xhtml2pdf treats 1px as 0.75pt, so cap at ~650px
 MAX_IMG_WIDTH_PX = 650
@@ -212,17 +249,85 @@ def render_mermaid_blocks(md_text: str, img_dir: Path) -> str:
     return MERMAID_BLOCK.sub(replace, md_text)
 
 
+def find_emoji_font() -> Path | None:
+    for font in EMOJI_FONT_CANDIDATES:
+        if font.is_file():
+            return font
+    return None
+
+
+def wrap_emoji(html: str, font: Path | None) -> str:
+    """Wrap emoji runs in a span styled with the emoji font.
+
+    Only characters the emoji font actually covers are wrapped; the rest
+    stay in the base font (e.g. ★ has a glyph there but not in Segoe UI
+    Emoji). U+FE0F presentation selectors are dropped — they occupy a
+    blank glyph of their own in the PDF.
+    """
+    if font is None:
+        print("WARNING: no emoji font found; emoji may render as boxes")
+        return html
+
+    from reportlab.pdfbase.ttfonts import TTFontFile
+
+    covered = set(TTFontFile(str(font)).charToGlyph)
+
+    def replace(match: re.Match) -> str:
+        out = []
+        for ch in match.group(0):
+            if ord(ch) == 0xFE0F:
+                continue
+            if ord(ch) in covered:
+                out.append(f'<span class="emoji">{ch}</span>')
+            else:
+                out.append(ch)
+        return "".join(out)
+
+    return EMOJI_RUN.sub(replace, html)
+
+
+def make_link_callback(base_dir: Path):
+    """Resolve image srcs relative to the markdown file, not the CWD."""
+
+    def link_callback(uri: str, rel: str) -> str:
+        if uri.startswith(("http://", "https://", "data:")):
+            return uri
+        # markdown URLs encode spaces as %20; decode before touching the fs
+        path = Path(unquote(uri))
+        if not path.is_absolute():
+            path = base_dir / path
+        if not path.is_file():
+            print(f"WARNING: image not found: {uri}")
+        return str(path)
+
+    return link_callback
+
+
 def convert(md_path: Path, pdf_path: Path) -> bool:
+    md_path = md_path.resolve()
     md_text = md_path.read_text(encoding="utf-8")
     md_text = render_mermaid_blocks(md_text, md_path.parent / f"{md_path.stem}_diagrams")
     body = markdown.markdown(
         md_text,
         extensions=["tables", "fenced_code", "sane_lists", "toc", "nl2br"],
     )
-    html = f"<html><head><style>{CSS}</style></head><body>{body}</body></html>"
+
+    css = CSS
+    emoji_font = find_emoji_font()
+    body = wrap_emoji(body, emoji_font)
+    if emoji_font:
+        css += (
+            f'@font-face {{ font-family: "emoji"; src: url("{emoji_font.as_posix()}"); }}\n'
+            '.emoji { font-family: "emoji"; }\n'
+        )
+
+    html = f"<html><head><style>{css}</style></head><body>{body}</body></html>"
 
     with pdf_path.open("wb") as f:
-        result = pisa.CreatePDF(html, dest=f, encoding="utf-8")
+        result = pisa.CreatePDF(
+            html, dest=f, encoding="utf-8",
+            link_callback=make_link_callback(md_path.parent),
+        )
     return not result.err
 
 
