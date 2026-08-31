@@ -19,6 +19,7 @@ import atexit
 import hashlib
 import re
 import sys
+from html import unescape
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -108,17 +109,18 @@ table {
     margin: 8px 0;
     font-size: 8.5pt;
 }
+th, td {
+    padding: 6px 8px;
+    border: 1px solid #888888;
+    vertical-align: middle;
+    word-wrap: break-word;
+}
 th {
     background-color: #0f2a4a;
     color: #ffffff;
-    padding: 5px;
-    border: 1px solid #444444;
+    border-color: #444444;
     text-align: left;
-}
-td {
-    padding: 5px;
-    border: 1px solid #888888;
-    vertical-align: top;
+    font-weight: bold;
 }
 code {
     font-family: Courier, monospace;
@@ -249,6 +251,125 @@ def render_mermaid_blocks(md_text: str, img_dir: Path) -> str:
     return MERMAID_BLOCK.sub(replace, md_text)
 
 
+# xhtml2pdf's auto column sizing collapses later columns. Measure cell text
+# and set explicit width="N%" on every <th>/<td> (colgroup is ignored).
+_TABLE_RE = re.compile(r"<table\b[^>]*>.*?</table>", re.DOTALL | re.IGNORECASE)
+_ROW_RE = re.compile(r"<tr\b[^>]*>(.*?)</tr>", re.DOTALL | re.IGNORECASE)
+_CELL_RE = re.compile(r"<t([hd])\b([^>]*)>(.*?)</t\1>", re.DOTALL | re.IGNORECASE)
+_TAG_RE = re.compile(r"<[^>]+>")
+_SPAN_RE = re.compile(r"""\b(?:col|row)span\s*=\s*['"]?\d+""", re.IGNORECASE)
+_WIDTH_ATTR_RE = re.compile(r"""\s*\bwidth\s*=\s*(['"]).*?\1""", re.IGNORECASE)
+_WIDTH_STYLE_RE = re.compile(
+    r"""(?:^|;)\s*width\s*:\s*[^;]+;?""", re.IGNORECASE
+)
+
+
+def _cell_text(html: str) -> str:
+    return unescape(_TAG_RE.sub("", html)).strip()
+
+
+def _column_weight(text: str) -> float:
+    """Score a cell for width allocation (diminishing returns on long text)."""
+    n = len(text)
+    if n <= 0:
+        return 4.0
+    # short labels count fully; long paragraphs don't monopolize the row
+    return max(4.0, min(n, 14) + (max(0, n - 14) ** 0.55))
+
+
+def _percent_widths(weights: list[float]) -> list[int]:
+    total = sum(weights) or 1.0
+    raw = [w / total * 100.0 for w in weights]
+    # guarantee every column a usable slice, then renormalize
+    floor = min(8.0, 100.0 / len(weights))
+    raw = [max(floor, r) for r in raw]
+    total = sum(raw)
+    pcts = [int(round(r / total * 100.0)) for r in raw]
+    # fix rounding so percentages sum to exactly 100
+    pcts[-1] += 100 - sum(pcts)
+    return pcts
+
+
+def _set_cell_width(attrs: str, pct: int) -> str:
+    """Replace any existing width with an explicit percentage attribute."""
+    attrs = _WIDTH_ATTR_RE.sub("", attrs)
+    # drop width from inline style if present, keep the rest
+    if "style=" in attrs.lower():
+        def scrub_style(m: re.Match) -> str:
+            quote = m.group(1)
+            cleaned = _WIDTH_STYLE_RE.sub("", m.group(2)).strip().strip(";").strip()
+            if not cleaned:
+                return ""
+            return f" style={quote}{cleaned}{quote}"
+
+        attrs = re.sub(
+            r"""\s*style\s*=\s*(['"])(.*?)\1""",
+            scrub_style,
+            attrs,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    return f'{attrs} width="{pct}%"'
+
+
+def balance_table_widths(html: str) -> str:
+    """Set per-cell width %% so xhtml2pdf doesn't crush trailing columns."""
+
+    def replace_table(match: re.Match) -> str:
+        table = match.group(0)
+        if _SPAN_RE.search(table):
+            return table  # leave complex grids alone
+
+        rows = _ROW_RE.findall(table)
+        if not rows:
+            return table
+
+        grid: list[list[str]] = []
+        for row_html in rows:
+            cells = _CELL_RE.findall(row_html)
+            if cells:
+                grid.append([_cell_text(c[2]) for c in cells])
+        if not grid:
+            return table
+
+        ncols = max(len(r) for r in grid)
+        if ncols < 2:
+            return table
+
+        weights = [0.0] * ncols
+        for row in grid:
+            for i, text in enumerate(row):
+                weights[i] = max(weights[i], _column_weight(text))
+        for i in range(ncols):
+            if weights[i] <= 0:
+                weights[i] = 4.0
+
+        pcts = _percent_widths(weights)
+
+        def replace_row(row_match: re.Match) -> str:
+            row_html = row_match.group(0)
+            cells = list(_CELL_RE.finditer(row_html))
+            if not cells:
+                return row_html
+            parts: list[str] = []
+            last = 0
+            for i, cell in enumerate(cells):
+                parts.append(row_html[last:cell.start()])
+                tag, attrs, content = cell.group(1), cell.group(2), cell.group(3)
+                pct = pcts[i] if i < len(pcts) else pcts[-1]
+                new_attrs = _set_cell_width(attrs, pct)
+                # empty cells collapse in xhtml2pdf — keep a non-breaking space
+                if not _cell_text(content):
+                    content = "&nbsp;"
+                parts.append(f"<t{tag}{new_attrs}>{content}</t{tag}>")
+                last = cell.end()
+            parts.append(row_html[last:])
+            return "".join(parts)
+
+        return _ROW_RE.sub(replace_row, table)
+
+    return _TABLE_RE.sub(replace_table, html)
+
+
 def find_emoji_font() -> Path | None:
     for font in EMOJI_FONT_CANDIDATES:
         if font.is_file():
@@ -315,6 +436,7 @@ def convert(md_path: Path, pdf_path: Path) -> bool:
     css = CSS
     emoji_font = find_emoji_font()
     body = wrap_emoji(body, emoji_font)
+    body = balance_table_widths(body)
     if emoji_font:
         css += (
             f'@font-face {{ font-family: "emoji"; src: url("{emoji_font.as_posix()}"); }}\n'
