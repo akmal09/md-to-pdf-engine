@@ -19,7 +19,7 @@ import atexit
 import hashlib
 import re
 import sys
-from html import unescape
+from html import escape, unescape
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -135,6 +135,8 @@ pre {
     border: 1px solid #dddddd;
     padding: 8px;
     margin: 8px 0;
+    white-space: pre-wrap;
+    word-wrap: break-word;
 }
 blockquote {
     border-left: 3px solid #1a5291;
@@ -370,6 +372,55 @@ def balance_table_widths(html: str) -> str:
     return _TABLE_RE.sub(replace_table, html)
 
 
+# A4 content width fits ~80 Courier 8pt chars; xhtml2pdf clips longer
+# <pre> lines, so we insert soft line breaks before PDF generation.
+_PRE_CODE_RE = re.compile(
+    r"(<pre\b[^>]*>\s*<code\b[^>]*>)(.*?)(</code>\s*</pre>)",
+    re.DOTALL | re.IGNORECASE,
+)
+_CODE_WRAP_WIDTH = 78
+_CODE_BREAK_CHARS = set(" ,;{}[]()='\":/\\|&<>")
+
+
+def _soft_wrap_line(line: str, width: int) -> list[str]:
+    """Break a long line near `width`, preferring punctuation/spaces."""
+    if len(line) <= width:
+        return [line]
+    out: list[str] = []
+    while len(line) > width:
+        cut = width
+        for i in range(width, max(width // 2, 0), -1):
+            if line[i - 1] in _CODE_BREAK_CHARS:
+                cut = i
+                break
+        else:
+            for i in range(width, min(len(line), width + 24)):
+                if line[i] in _CODE_BREAK_CHARS:
+                    cut = i + 1
+                    break
+        out.append(line[:cut])
+        line = line[cut:]
+    if line:
+        out.append(line)
+    return out
+
+
+def soft_wrap_code_blocks(html: str, width: int = _CODE_WRAP_WIDTH) -> str:
+    """Insert newlines into long <pre><code> lines so PDF shows full queries."""
+
+    def wrap_text(text: str) -> str:
+        lines: list[str] = []
+        for line in text.split("\n"):
+            lines.extend(_soft_wrap_line(line, width))
+        return "\n".join(lines)
+
+    def replace_pre_code(match: re.Match) -> str:
+        inner = unescape(match.group(2))
+        return match.group(1) + escape(wrap_text(inner)) + match.group(3)
+
+    return _PRE_CODE_RE.sub(replace_pre_code, html)
+
+
 def find_emoji_font() -> Path | None:
     for font in EMOJI_FONT_CANDIDATES:
         if font.is_file():
@@ -437,6 +488,7 @@ def convert(md_path: Path, pdf_path: Path) -> bool:
     emoji_font = find_emoji_font()
     body = wrap_emoji(body, emoji_font)
     body = balance_table_widths(body)
+    body = soft_wrap_code_blocks(body)
     if emoji_font:
         css += (
             f'@font-face {{ font-family: "emoji"; src: url("{emoji_font.as_posix()}"); }}\n'
