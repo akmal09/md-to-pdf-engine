@@ -4,6 +4,9 @@ Usage:
     python md_to_pdf.py <input.md> [output.pdf]
 
 Uses `markdown` to render HTML and `xhtml2pdf` to produce the PDF.
+Fenced code blocks get a dark theme and optional Pygments highlighting
+(`pip install pygments`); newlines are preserved via <br/> because
+xhtml2pdf collapses whitespace inside <pre>.
 Mermaid diagrams are rendered to PNG locally: the vendored Mermaid
 bundle (vendor/mermaid-10.9.6.min.js) runs inside headless Chromium
 via Playwright, so diagram content never leaves this machine. Images
@@ -11,6 +14,7 @@ are cached in <input>_diagrams/ next to the markdown file, so repeated
 runs don't re-render unchanged diagrams.
 
 One-time setup:
+    python -m pip install markdown xhtml2pdf pygments
     python -m pip install playwright
     python -m playwright install chromium
 """
@@ -128,15 +132,23 @@ code {
     color: #b03050;
     background-color: #f4f4f4;
 }
+/* Fenced ``` blocks: dark editor-style panel. Newlines are turned into
+   <br/> before PDF generation — xhtml2pdf ignores whitespace in <pre>.
+   Use the same dark fill on pre code (not transparent): xhtml2pdf paints
+   the generic code background as opaque white boxes otherwise. */
 pre {
     font-family: Courier, monospace;
     font-size: 8pt;
-    background-color: #f4f4f4;
-    border: 1px solid #dddddd;
-    padding: 8px;
+    background-color: #1e1e1e;
+    color: #f8f8f2;
+    border: 1px solid #333333;
+    padding: 10px;
     margin: 8px 0;
-    white-space: pre-wrap;
-    word-wrap: break-word;
+}
+pre code {
+    color: #f8f8f2;
+    background-color: #1e1e1e;
+    font-size: inherit;
 }
 blockquote {
     border-left: 3px solid #1a5291;
@@ -374,12 +386,18 @@ def balance_table_widths(html: str) -> str:
 
 # A4 content width fits ~80 Courier 8pt chars; xhtml2pdf clips longer
 # <pre> lines, so we insert soft line breaks before PDF generation.
+# xhtml2pdf also collapses \n inside <pre>, so final newlines become <br/>.
 _PRE_CODE_RE = re.compile(
-    r"(<pre\b[^>]*>\s*<code\b[^>]*>)(.*?)(</code>\s*</pre>)",
+    r"<pre\b[^>]*>\s*<code\b([^>]*)>(.*?)</code>\s*</pre>",
     re.DOTALL | re.IGNORECASE,
 )
+_LANG_CLASS_RE = re.compile(
+    r"""class\s*=\s*['"][^'"]*\blanguage-([\w+-]+)""", re.IGNORECASE
+)
 _CODE_WRAP_WIDTH = 78
-_CODE_BREAK_CHARS = set(" ,;{}[]()='\":/\\|&<>")
+# Prefer breaking after separators; avoid quotes so strings like '"SYSTEM"'
+# don't split mid-token.
+_CODE_BREAK_CHARS = set(" ,;{}[]()=/\\|&<>")
 
 
 def _soft_wrap_line(line: str, width: int) -> list[str]:
@@ -405,18 +423,45 @@ def _soft_wrap_line(line: str, width: int) -> list[str]:
     return out
 
 
-def soft_wrap_code_blocks(html: str, width: int = _CODE_WRAP_WIDTH) -> str:
-    """Insert newlines into long <pre><code> lines so PDF shows full queries."""
+def _soft_wrap_text(text: str, width: int) -> str:
+    lines: list[str] = []
+    for line in text.split("\n"):
+        lines.extend(_soft_wrap_line(line, width))
+    return "\n".join(lines)
 
-    def wrap_text(text: str) -> str:
-        lines: list[str] = []
-        for line in text.split("\n"):
-            lines.extend(_soft_wrap_line(line, width))
-        return "\n".join(lines)
+
+def _highlight_code(text: str, language: str | None) -> str:
+    """Return HTML for a code block; fall back to escaped text if needed."""
+    try:
+        from pygments import highlight
+        from pygments.formatters import HtmlFormatter
+        from pygments.lexers import TextLexer, get_lexer_by_name
+        from pygments.util import ClassNotFound
+    except ImportError:
+        return escape(text)
+
+    try:
+        lexer = get_lexer_by_name(language) if language else TextLexer()
+    except ClassNotFound:
+        lexer = TextLexer()
+    # noclasses=True embeds colors as inline styles (xhtml2pdf-friendly).
+    # monokai matches the dark-editor look of expected.png.
+    formatter = HtmlFormatter(noclasses=True, style="monokai", nowrap=True)
+    return highlight(text, lexer, formatter)
+
+
+def format_code_blocks(html: str, width: int = _CODE_WRAP_WIDTH) -> str:
+    """Style fenced code for PDF: soft-wrap, highlight, keep real line breaks."""
 
     def replace_pre_code(match: re.Match) -> str:
-        inner = unescape(match.group(2))
-        return match.group(1) + escape(wrap_text(inner)) + match.group(3)
+        attrs, inner = match.group(1), match.group(2)
+        lang_match = _LANG_CLASS_RE.search(attrs or "")
+        language = lang_match.group(1) if lang_match else None
+        text = _soft_wrap_text(unescape(inner), width)
+        body = _highlight_code(text, language).rstrip("\n").replace("\n", "<br/>")
+        # Keep content in <pre> only — a nested <code> re-applies the light
+        # inline-code background under xhtml2pdf and hides highlighted text.
+        return f"<pre>{body}</pre>"
 
     return _PRE_CODE_RE.sub(replace_pre_code, html)
 
@@ -488,7 +533,7 @@ def convert(md_path: Path, pdf_path: Path) -> bool:
     emoji_font = find_emoji_font()
     body = wrap_emoji(body, emoji_font)
     body = balance_table_widths(body)
-    body = soft_wrap_code_blocks(body)
+    body = format_code_blocks(body)
     if emoji_font:
         css += (
             f'@font-face {{ font-family: "emoji"; src: url("{emoji_font.as_posix()}"); }}\n'
